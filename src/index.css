@@ -1,0 +1,44 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-cinzel: "Cinzel", serif;
+  --font-sans: "Plus Jakarta Sans", sans-serif;
+  --color-gold-400: #eec550;
+  --color-gold-500: #d4af37;
+  --color-gold-600: #b59226;
+  --color-parchment-100: #faf6ed;
+  --color-parchment-200: #f4ecd8;
+  --color-parchment-300: #e8dcbe;
+  --color-parchment-400: #d6c59d;
+  --color-realm-navy: #090d16;
+  --color-realm-slate: #131c2e;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #090d16;
+  color: #e2d5b8;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.font-cinzel {
+  font-family: var(--font-cinzel);
+}
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(10, 15, 25, 0.6);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(212, 175, 55, 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(212, 175, 55, 0.6);
+}

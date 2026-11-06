@@ -1,0 +1,6 @@
+{
+  "name": "Lords of the Realm - 3D Medieval Strategy",
+  "description": "A playable 3D medieval grand strategy sandbox game with interactive parchment world map, rival AI lords, real-time tactical combat, and dynamic narrative chronicles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
