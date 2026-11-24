@@ -1,15 +1,30 @@
-import React, { useEffect, useRef, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { Territory, Army, BattleState, RivalLord, PlayerHouse } from '../../types/game';
 import {
-  createParchmentTexture,
+  MAP_WIDTH,
+  MAP_HEIGHT,
+  terrainHeight,
+  disposeOwnedResources,
+  configureTerrain,
+  layoutBiomeScenery,
+  createParchmentGround,
+  createPictureFrame,
   createMedievalCastleGroup,
-  createSettlementGroup,
-  createMountainPeak,
-  createPineTree,
-  createArmyFigure,
+  createTerritoryDisc,
+  createTerritoryRing,
+  createProvinceLabel,
+  createRiverRibbon,
+  createCoastWashGeometry,
+  createArmyFormation,
   createBattleClashMarker,
+  createRoadGeometry,
+  hitMaterial,
+  riverMaterial,
+  coastMaterial,
+  roadMaterial,
+  sharedScenery,
 } from './proceduralAssets';
 import { Language, TRANSLATIONS } from '../../i18n/translations';
 
@@ -26,6 +41,50 @@ interface StrategyWorldMapProps {
   language?: Language;
 }
 
+const DEFAULT_PHI = 0.74;
+const DEFAULT_THETA = 0.48;
+const DEFAULT_RADIUS = 34;
+const GOLD_LIGHT = new THREE.Color('#ffe7a3');
+
+const HOUSE_OFFSETS = [
+  { x: 0.78, z: 0.42, rot: 0.2 },
+  { x: 1.12, z: 0.78, rot: -0.45 },
+  { x: 0.88, z: 1.12, rot: 0.85 },
+];
+
+type MapView = {
+  target: THREE.Vector3;
+  radius: number;
+  phi: number;
+  theta: number;
+};
+
+function poseFromView(view: MapView, out: THREE.Vector3) {
+  const sinPhi = Math.sin(view.phi);
+  out.set(
+    view.target.x + view.radius * sinPhi * Math.sin(view.theta),
+    view.target.y + view.radius * Math.cos(view.phi),
+    view.target.z + view.radius * sinPhi * Math.cos(view.theta),
+  );
+  return out;
+}
+
+function territorySignature(territories: Territory[], playerHouse: PlayerHouse, rivals: RivalLord[]) {
+  const colors = `${playerHouse.color}:${playerHouse.sigil}|${rivals.map((rival) => `${rival.id}:${rival.color}`).join(',')}`;
+  const body = territories
+    .map((territory) =>
+      `${territory.id}:${territory.ownerId}:${territory.position.x}:${territory.position.z}:${territory.buildings.join('+')}:${territory.name}`,
+    )
+    .join('|');
+  return `${colors}#${body}`;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) hash = (hash * 31 + value.charCodeAt(i)) | 0;
+  return Math.abs(hash);
+}
+
 export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
   territories,
   armies,
@@ -40,8 +99,15 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
 }) => {
   const t = TRANSLATIONS[language];
   const mountRef = useRef<HTMLDivElement>(null);
+  const apiRef = useRef<{ sync: () => void } | null>(null);
+  const viewRef = useRef<MapView>({
+    target: new THREE.Vector3(0, 0, 0),
+    radius: DEFAULT_RADIUS,
+    phi: DEFAULT_PHI,
+    theta: DEFAULT_THETA,
+  });
+  const focusSeededRef = useRef(false);
 
-  // Store mutable refs to synchronize with animation frame
   const stateRef = useRef({
     territories,
     armies,
@@ -66,33 +132,29 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     isDispatchingArmy,
   };
 
-  // Camera animation state
-  const cameraTargetRef = useRef(new THREE.Vector3(0, 0, 0));
-  const cameraPosRef = useRef(new THREE.Vector3(0, 16, 12));
-  const isUserDraggingRef = useRef(false);
-  const dragStartRef = useRef({ x: 0, y: 0 });
-  const mousePosRef = useRef(new THREE.Vector2());
-
-  // Focus camera on selected territory
-  useEffect(() => {
-    if (!selectedTerritoryId) return;
-    const t = territories.find((item) => item.id === selectedTerritoryId);
-    if (t) {
-      cameraTargetRef.current.set(t.position.x, 0, t.position.z);
-      cameraPosRef.current.set(t.position.x, 11, t.position.z + 8.5);
-    }
-  }, [selectedTerritoryId, territories]);
-
   const resetCamera = useCallback(() => {
-    cameraTargetRef.current.set(0, 0, 0);
-    cameraPosRef.current.set(0, 17, 13);
+    viewRef.current.target.set(0, 0, 0);
+    viewRef.current.phi = DEFAULT_PHI;
+    viewRef.current.theta = DEFAULT_THETA;
+    viewRef.current.radius = DEFAULT_RADIUS;
   }, []);
+
+  useEffect(() => {
+    if (!focusSeededRef.current) {
+      focusSeededRef.current = true;
+      return;
+    }
+    if (!selectedTerritoryId) return;
+    const territory = stateRef.current.territories.find((item) => item.id === selectedTerritoryId);
+    if (!territory) return;
+    viewRef.current.target.set(territory.position.x, 0, territory.position.z);
+    if (viewRef.current.radius > 22) viewRef.current.radius = 17;
+  }, [selectedTerritoryId]);
 
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
 
-    // Detect software GL
     const isSoftwareGl = (() => {
       const gl = document.createElement('canvas').getContext('webgl2');
       if (!gl) return true;
@@ -107,12 +169,16 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     scene.background = new THREE.Color('#0b101c');
     scene.fog = new THREE.FogExp2(0x0b101c, 0.022);
 
-    const width = container.clientWidth;
-    const height = container.clientHeight;
+    const width = Math.max(container.clientWidth, 1);
+    const height = Math.max(container.clientHeight, 1);
 
-    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
-    camera.position.copy(cameraPosRef.current);
-    camera.lookAt(cameraTargetRef.current);
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 180);
+    const desiredPos = new THREE.Vector3();
+    const lookAt = new THREE.Vector3();
+    poseFromView(viewRef.current, desiredPos);
+    camera.position.copy(desiredPos);
+    lookAt.copy(viewRef.current.target);
+    camera.lookAt(lookAt);
 
     const renderer = new THREE.WebGLRenderer({
       antialias: !isSoftwareGl,
@@ -126,22 +192,28 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     renderer.toneMappingExposure = 1.15;
     renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-
+    renderer.domElement.style.touchAction = 'none';
     container.appendChild(renderer.domElement);
 
-    // Environment map for authentic metallic & stone reflections
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    const room = new RoomEnvironment();
+    const envTexture = pmremGenerator.fromScene(room, 0.04).texture;
+    scene.environment = envTexture;
     pmremGenerator.dispose();
+    disposeOwnedResources(room);
+    room.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      mesh.geometry?.dispose();
+      const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+      if (!material) return;
+      (Array.isArray(material) ? material : [material]).forEach((mat) => mat.dispose());
+    });
 
-    // Studio Lighting Rig
     const ambientLight = new THREE.AmbientLight(0xd4af37, 0.35);
     scene.add(ambientLight);
-
     const hemiLight = new THREE.HemisphereLight(0xdde9f8, 0x3d3020, 0.6);
     hemiLight.position.set(0, 20, 0);
     scene.add(hemiLight);
-
     const dirLight = new THREE.DirectionalLight(0xfff1dc, 1.6);
     dirLight.position.set(12, 22, 14);
     dirLight.castShadow = !isSoftwareGl;
@@ -150,400 +222,529 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
       dirLight.shadow.mapSize.height = 1024;
       dirLight.shadow.camera.near = 0.5;
       dirLight.shadow.camera.far = 50;
-      const d = 16;
-      dirLight.shadow.camera.left = -d;
-      dirLight.shadow.camera.right = d;
-      dirLight.shadow.camera.top = d;
-      dirLight.shadow.camera.bottom = -d;
+      const shadowExtent = 16;
+      dirLight.shadow.camera.left = -shadowExtent;
+      dirLight.shadow.camera.right = shadowExtent;
+      dirLight.shadow.camera.top = shadowExtent;
+      dirLight.shadow.camera.bottom = -shadowExtent;
       dirLight.shadow.bias = -0.0005;
       dirLight.shadow.normalBias = 0.02;
     }
     scene.add(dirLight);
-
-    // Warm rim light
     const rimLight = new THREE.DirectionalLight(0xcaa462, 0.5);
     rimLight.position.set(-15, 10, -12);
     scene.add(rimLight);
 
-    // 1. Parchment Map Base Mesh
-    const mapWidth = 26;
-    const mapHeight = 24;
-    const parchmentTexture = createParchmentTexture();
+    const scenery = layoutBiomeScenery(stateRef.current.territories);
+    configureTerrain(scenery.anchors, scenery.beds, scenery.tints);
 
-    const groundGeo = new THREE.PlaneGeometry(mapWidth, mapHeight, 64, 64);
-    groundGeo.rotateX(-Math.PI / 2);
-
-    // Procedural terrain elevation relief
-    const posAttr = groundGeo.attributes.position;
-    for (let i = 0; i < posAttr.count; i++) {
-      const vx = posAttr.getX(i);
-      const vz = posAttr.getZ(i);
-      // Subtle hills and coastline contours
-      const elev =
-        Math.sin(vx * 0.35) * Math.cos(vz * 0.3) * 0.35 +
-        Math.sin(vx * 0.8 + vz * 0.4) * 0.18 +
-        (Math.abs(vx) > 9 || Math.abs(vz) > 8 ? -0.4 : 0);
-      posAttr.setY(i, Math.max(-0.25, elev));
-    }
-    groundGeo.computeVertexNormals();
-
-    const groundMat = new THREE.MeshStandardMaterial({
-      map: parchmentTexture,
-      roughness: 0.88,
-      metalness: 0.08,
-    });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
+    const ground = createParchmentGround();
     ground.receiveShadow = !isSoftwareGl;
     scene.add(ground);
+    scene.add(createPictureFrame());
 
-    // Map Border Frame (Ornate carved wood and gold trim)
-    const frameGeo = new THREE.BoxGeometry(mapWidth + 0.8, 0.4, mapHeight + 0.8);
-    const frameMat = new THREE.MeshStandardMaterial({
-      color: 0x22170d,
-      roughness: 0.7,
-      metalness: 0.3,
+    const waterGroup = new THREE.Group();
+    scene.add(waterGroup);
+    const addWater = (
+      geometry: THREE.BufferGeometry,
+      material: THREE.Material,
+      x = 0,
+      z = 0,
+    ) => {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, 0, z);
+      mesh.renderOrder = 2.5;
+      waterGroup.add(mesh);
+    };
+    scenery.rivers.forEach((path) => addWater(createRiverRibbon(path, 0.34), riverMaterial));
+    scenery.coasts.forEach((coast) => {
+      addWater(createCoastWashGeometry(coast.x, coast.z, coast.rx, coast.rz), coastMaterial, coast.x, coast.z);
     });
-    const frame = new THREE.Mesh(frameGeo, frameMat);
-    frame.position.y = -0.22;
-    scene.add(frame);
 
-    // Gold inner rim
-    const goldRimGeo = new THREE.BoxGeometry(mapWidth + 0.1, 0.15, mapHeight + 0.1);
-    const goldRimMat = new THREE.MeshStandardMaterial({
-      color: 0xd4af37,
-      metalness: 0.85,
-      roughness: 0.25,
+    const roadGroup = new THREE.Group();
+    scene.add(roadGroup);
+    const drawnRoads = new Set<string>();
+    stateRef.current.territories.forEach((territory) => {
+      territory.connectedTo.forEach((neighborId) => {
+        const key = [territory.id, neighborId].sort().join('--');
+        if (drawnRoads.has(key)) return;
+        drawnRoads.add(key);
+        const target = stateRef.current.territories.find((item) => item.id === neighborId);
+        if (!target) return;
+        const points: THREE.Vector3[] = [];
+        for (let step = 0; step <= 8; step++) {
+          const u = step / 8;
+          const x = THREE.MathUtils.lerp(territory.position.x, target.position.x, u);
+          const z = THREE.MathUtils.lerp(territory.position.z, target.position.z, u);
+          points.push(new THREE.Vector3(x, terrainHeight(x, z) + 0.06, z));
+        }
+        roadGroup.add(new THREE.Mesh(createRoadGeometry(points), roadMaterial));
+      });
     });
-    const goldRim = new THREE.Mesh(goldRimGeo, goldRimMat);
-    goldRim.position.y = 0.02;
-    scene.add(goldRim);
 
-    // Territory Containers & Raycasting Objects
-    const territoryMeshesGroup = new THREE.Group();
-    scene.add(territoryMeshesGroup);
+    const dummy = new THREE.Object3D();
+    const treeCount = Math.max(scenery.forests.length, 1);
+    const trunkMesh = new THREE.InstancedMesh(sharedScenery.trunkGeo, sharedScenery.trunkMat, treeCount);
+    const tierMeshes = sharedScenery.treeTierGeos.map(
+      (geo) => new THREE.InstancedMesh(geo, sharedScenery.needleMat, treeCount),
+    );
+    const leafColor = new THREE.Color();
+    scenery.forests.forEach((tree, index) => {
+      dummy.position.set(tree.x, terrainHeight(tree.x, tree.z), tree.z);
+      dummy.rotation.set(0, tree.rot, 0);
+      dummy.scale.setScalar(tree.scale);
+      dummy.updateMatrix();
+      trunkMesh.setMatrixAt(index, dummy.matrix);
+      leafColor.setRGB(tree.tint * 0.82, tree.tint * 1.18, tree.tint * 0.72);
+      tierMeshes.forEach((mesh) => {
+        mesh.setMatrixAt(index, dummy.matrix);
+        mesh.setColorAt(index, leafColor);
+      });
+    });
+    trunkMesh.count = scenery.forests.length;
+    tierMeshes.forEach((mesh) => {
+      mesh.count = scenery.forests.length;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    });
+    [trunkMesh, ...tierMeshes].forEach((mesh) => {
+      mesh.frustumCulled = false;
+      mesh.castShadow = false;
+      scene.add(mesh);
+    });
 
-    // Dynamic objects groups
-    const castlesGroup = new THREE.Group();
-    scene.add(castlesGroup);
+    const peakCount = Math.max(scenery.mountains.length, 1);
+    const peakMesh = new THREE.InstancedMesh(sharedScenery.peakGeo, sharedScenery.rockMat, peakCount);
+    const snowMesh = new THREE.InstancedMesh(sharedScenery.snowCapGeo, sharedScenery.snowMat, peakCount);
+    const subAMesh = new THREE.InstancedMesh(sharedScenery.subPeakAGeo, sharedScenery.rockMat, peakCount);
+    const subBMesh = new THREE.InstancedMesh(sharedScenery.subPeakBGeo, sharedScenery.rockMat, peakCount);
+    scenery.mountains.forEach((mountain, index) => {
+      const groundY = terrainHeight(mountain.x, mountain.z);
+      dummy.position.set(mountain.x, groundY, mountain.z);
+      dummy.rotation.set(0, mountain.rot, 0);
+      dummy.scale.setScalar(mountain.s);
+      dummy.updateMatrix();
+      peakMesh.setMatrixAt(index, dummy.matrix);
 
-    const sceneryGroup = new THREE.Group();
-    scene.add(sceneryGroup);
+      dummy.position.set(mountain.x, groundY + 1.02 * mountain.s, mountain.z);
+      dummy.updateMatrix();
+      snowMesh.setMatrixAt(index, dummy.matrix);
 
-    const roadLinesGroup = new THREE.Group();
-    scene.add(roadLinesGroup);
+      dummy.position.set(mountain.x + 0.35 * mountain.s, groundY, mountain.z + 0.22 * mountain.s);
+      dummy.scale.setScalar(mountain.s);
+      dummy.updateMatrix();
+      subAMesh.setMatrixAt(index, dummy.matrix);
 
+      dummy.position.set(mountain.x - 0.3 * mountain.s, groundY, mountain.z - 0.18 * mountain.s);
+      dummy.updateMatrix();
+      subBMesh.setMatrixAt(index, dummy.matrix);
+    });
+    peakMesh.count = scenery.mountains.length;
+    snowMesh.count = scenery.mountains.length;
+    subAMesh.count = scenery.mountains.length;
+    subBMesh.count = scenery.mountains.length;
+    peakMesh.castShadow = !isSoftwareGl && scenery.mountains.length > 0;
+    peakMesh.receiveShadow = !isSoftwareGl && scenery.mountains.length > 0;
+    [peakMesh, snowMesh, subAMesh, subBMesh].forEach((mesh) => {
+      mesh.frustumCulled = false;
+      mesh.visible = scenery.mountains.length > 0;
+      scene.add(mesh);
+    });
+
+    const houseCapacity = 48;
+    const houseBaseMesh = new THREE.InstancedMesh(
+      sharedScenery.houseBaseGeo,
+      sharedScenery.woodMat,
+      houseCapacity,
+    );
+    const houseRoofMesh = new THREE.InstancedMesh(
+      sharedScenery.houseRoofGeo,
+      sharedScenery.thatchMat,
+      houseCapacity,
+    );
+    houseBaseMesh.frustumCulled = false;
+    houseRoofMesh.frustumCulled = false;
+    houseBaseMesh.count = 0;
+    houseRoofMesh.count = 0;
+    scene.add(houseBaseMesh);
+    scene.add(houseRoofMesh);
+
+    const territoryGroup = new THREE.Group();
+    scene.add(territoryGroup);
     const armiesGroup = new THREE.Group();
     scene.add(armiesGroup);
-
     const battlesGroup = new THREE.Group();
     scene.add(battlesGroup);
 
-    // Helper to get owner color
+    type TerritoryVisual = {
+      id: string;
+      disc: THREE.Mesh;
+      ring: THREE.Mesh;
+      label: THREE.Sprite;
+      baseColor: THREE.Color;
+    };
+    let visuals: TerritoryVisual[] = [];
+    let hitboxes: THREE.Mesh[] = [];
+    let banners: THREE.Object3D[] = [];
+    let visualSignature = '';
+
     const getLordColor = (ownerId: string) => {
       if (ownerId === 'player') return stateRef.current.playerHouse.color;
-      const rival = stateRef.current.rivalLords.find((r) => r.id === ownerId);
-      return rival ? rival.color : '#64748b'; // Slate gray for neutral
+      const rival = stateRef.current.rivalLords.find((item) => item.id === ownerId);
+      return rival ? rival.color : '#64748b';
     };
 
     const getLordSigil = (ownerId: string) => {
-      if (ownerId === 'player') return '⚔️';
-      const rival = stateRef.current.rivalLords.find((r) => r.id === ownerId);
-      return rival ? rival.portraitIcon : '🛡️';
+      if (ownerId === 'player') return stateRef.current.playerHouse.sigil || 'Shield';
+      if (ownerId === 'lord_edmund') return 'Boar';
+      if (ownerId === 'lady_eleanor') return 'Swan';
+      if (ownerId === 'lord_blackwood') return 'Raven';
+      if (ownerId === 'king_aldric') return 'Crown';
+      return 'Shield';
     };
 
-    // Draw connecting trade roads
-    const drawnRoads = new Set<string>();
-    stateRef.current.territories.forEach((t) => {
-      t.connectedTo.forEach((neighborId) => {
-        const key = [t.id, neighborId].sort().join('--');
-        if (drawnRoads.has(key)) return;
-        drawnRoads.add(key);
-
-        const target = stateRef.current.territories.find((item) => item.id === neighborId);
-        if (!target) return;
-
-        const points = [
-          new THREE.Vector3(t.position.x, 0.05, t.position.z),
-          new THREE.Vector3(
-            (t.position.x + target.position.x) / 2,
-            0.08,
-            (t.position.z + target.position.z) / 2
-          ),
-          new THREE.Vector3(target.position.x, 0.05, target.position.z),
-        ];
-
-        const curve = new THREE.CatmullRomCurve3(points);
-        const roadGeo = new THREE.TubeGeometry(curve, 16, 0.04, 5, false);
-        const roadMat = new THREE.MeshStandardMaterial({
-          color: 0x8b6f47,
-          roughness: 0.95,
+    const layoutHouses = (list: Territory[]) => {
+      let index = 0;
+      list.forEach((territory) => {
+        HOUSE_OFFSETS.forEach((offset) => {
+          if (index >= houseCapacity) return;
+          const x = territory.position.x + offset.x;
+          const z = territory.position.z + offset.z;
+          dummy.position.set(x, terrainHeight(x, z), z);
+          dummy.rotation.set(0, offset.rot, 0);
+          dummy.scale.setScalar(0.95);
+          dummy.updateMatrix();
+          houseBaseMesh.setMatrixAt(index, dummy.matrix);
+          houseRoofMesh.setMatrixAt(index, dummy.matrix);
+          index += 1;
         });
-        const roadMesh = new THREE.Mesh(roadGeo, roadMat);
-        roadLinesGroup.add(roadMesh);
       });
-    });
+      houseBaseMesh.count = index;
+      houseRoofMesh.count = index;
+      houseBaseMesh.instanceMatrix.needsUpdate = true;
+      houseRoofMesh.instanceMatrix.needsUpdate = true;
+    };
 
-    // Populate Territories & Castles
-    const territoryHitBoxes: THREE.Mesh[] = [];
+    const syncTerritories = () => {
+      const snapshot = stateRef.current;
+      const nextSignature = territorySignature(snapshot.territories, snapshot.playerHouse, snapshot.rivalLords);
+      if (nextSignature === visualSignature) return;
+      visualSignature = nextSignature;
 
-    const buildTerritoryObjects = () => {
-      // Clear previous castles and hitboxes
-      while (castlesGroup.children.length > 0) {
-        castlesGroup.remove(castlesGroup.children[0]);
+      for (const child of [...territoryGroup.children]) {
+        territoryGroup.remove(child);
+        disposeOwnedResources(child);
       }
-      while (territoryMeshesGroup.children.length > 0) {
-        territoryMeshesGroup.remove(territoryMeshesGroup.children[0]);
-      }
-      territoryHitBoxes.length = 0;
+      visuals = [];
+      hitboxes = [];
+      banners = [];
 
-      stateRef.current.territories.forEach((t) => {
-        const color = getLordColor(t.ownerId);
-        const sigil = getLordSigil(t.ownerId);
-        const isSelected = t.id === stateRef.current.selectedTerritoryId;
-
-        // 1. Territory Boundary Disc (Illuminated Parchment Ring)
-        const discRadius = 1.9;
-        const discGeo = new THREE.CylinderGeometry(discRadius, discRadius, 0.02, 32);
-        const discMat = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(color),
-          roughness: 0.6,
-          metalness: 0.15,
-          transparent: true,
-          opacity: isSelected ? 0.45 : 0.22,
+      snapshot.territories.forEach((territory) => {
+        const faction = new THREE.Color(getLordColor(territory.ownerId));
+        const ringColor = faction.clone().lerp(new THREE.Color('#d4af37'), 0.42);
+        const disc = createTerritoryDisc(territory.position.x, territory.position.z, faction);
+        const ring = createTerritoryRing(territory.position.x, territory.position.z, ringColor);
+        const castle = createMedievalCastleGroup(
+          getLordColor(territory.ownerId),
+          getLordSigil(territory.ownerId),
+          territory.buildings,
+        );
+        const groundY = terrainHeight(territory.position.x, territory.position.z);
+        castle.position.set(territory.position.x, groundY, territory.position.z);
+        castle.rotation.y = ((hashString(territory.id) % 500) / 1000) - 0.25;
+        if (!isSoftwareGl) {
+          castle.traverse((obj) => {
+            const mesh = obj as THREE.Mesh;
+            if (mesh.castShadow) {
+              mesh.castShadow = true;
+              mesh.receiveShadow = true;
+            }
+          });
+        } else {
+          castle.traverse((obj) => {
+            const mesh = obj as THREE.Mesh;
+            mesh.castShadow = false;
+            mesh.receiveShadow = false;
+          });
+        }
+        castle.traverse((obj) => {
+          if (obj.name === 'banner') banners.push(obj);
         });
-        const disc = new THREE.Mesh(discGeo, discMat);
-        disc.position.set(t.position.x, 0.03, t.position.z);
-        disc.receiveShadow = !isSoftwareGl;
-        territoryMeshesGroup.add(disc);
 
-        // Gold illuminated border ring
-        const ringGeo = new THREE.RingGeometry(discRadius - 0.06, discRadius, 32);
-        ringGeo.rotateX(-Math.PI / 2);
-        const ringMat = new THREE.MeshBasicMaterial({
-          color: isSelected ? 0xffffff : new THREE.Color(color).lerp(new THREE.Color(0xd4af37), 0.5),
-          side: THREE.DoubleSide,
-        });
-        const ring = new THREE.Mesh(ringGeo, ringMat);
-        ring.position.set(t.position.x, 0.04, t.position.z);
-        territoryMeshesGroup.add(ring);
+        const label = createProvinceLabel(territory.name);
+        label.position.set(territory.position.x, groundY + 2.55, territory.position.z);
 
-        // 2. Castle Group
-        const castleScale = t.buildings.includes('castleKeep') ? 1.05 : 0.85;
-        const castle = createMedievalCastleGroup(color, sigil, castleScale);
-        castle.position.set(t.position.x, 0.05, t.position.z);
-        castlesGroup.add(castle);
+        const hit = new THREE.Mesh(new THREE.CylinderGeometry(1.62, 1.62, 2.8, 12), hitMaterial);
+        hit.geometry.userData.dispose = true;
+        hit.position.set(territory.position.x, groundY + 1.3, territory.position.z);
+        hit.userData.territoryId = territory.id;
 
-        // 3. Surrounding Village Houses
-        const village = createSettlementGroup();
-        village.position.set(t.position.x + 0.95, 0.05, t.position.z + 0.65);
-        village.scale.set(0.9, 0.9, 0.9);
-        castlesGroup.add(village);
+        territoryGroup.add(disc, ring, castle, label, hit);
+        visuals.push({ id: territory.id, disc, ring, label, baseColor: ringColor });
+        hitboxes.push(hit);
+      });
 
-        // 4. Raycast hit target (Invisible cylinder for easy clicking)
-        const hitGeo = new THREE.CylinderGeometry(2.1, 2.1, 2.5, 16);
-        const hitMat = new THREE.MeshBasicMaterial({
-          transparent: true,
-          opacity: 0.0,
-          depthWrite: false,
-        });
-        const hitBox = new THREE.Mesh(hitGeo, hitMat);
-        hitBox.position.set(t.position.x, 1.25, t.position.z);
-        hitBox.userData = { territoryId: t.id };
-        territoryMeshesGroup.add(hitBox);
-        territoryHitBoxes.push(hitBox);
+      layoutHouses(snapshot.territories);
+    };
+
+    const updateHighlights = (hoverId: string | null) => {
+      const selectedId = stateRef.current.selectedTerritoryId;
+      visuals.forEach((visual) => {
+        const selected = visual.id === selectedId;
+        const hovered = visual.id === hoverId;
+        const ringMat = visual.ring.material as THREE.MeshBasicMaterial;
+        const discMat = visual.disc.material as THREE.MeshBasicMaterial;
+        ringMat.color.copy(visual.baseColor);
+        if (selected) ringMat.color.lerp(GOLD_LIGHT, 0.7);
+        else if (hovered) ringMat.color.lerp(GOLD_LIGHT, 0.5);
+        ringMat.opacity = selected ? 1 : hovered ? 0.98 : 0.78;
+        discMat.opacity = selected ? 0.42 : hovered ? 0.34 : 0.18;
+        const labelMat = visual.label.material as THREE.SpriteMaterial;
+        labelMat.opacity = selected || hovered ? 1 : 0.72;
+        const baseX = visual.label.userData.baseScaleX as number;
+        const baseY = visual.label.userData.baseScaleY as number;
+        const boost = selected || hovered ? 1.16 : 1;
+        visual.label.scale.set(baseX * boost, baseY * boost, 1);
       });
     };
 
-    buildTerritoryObjects();
+    syncTerritories();
+    apiRef.current = { sync: syncTerritories };
 
-    // Natural scenery: Mountain ranges & Pine forests
-    const mountainCoords = [
-      { x: 7.2, z: 1.5, s: 1.3 },
-      { x: 6.8, z: 3.2, s: 1.1 },
-      { x: 8.0, z: -1.2, s: 1.4 },
-      { x: -7.5, z: 2.8, s: 1.2 },
-      { x: -8.2, z: 0.5, s: 1.5 },
-      { x: 3.5, z: -6.0, s: 1.2 },
-      { x: 4.8, z: -7.5, s: 1.4 },
-    ];
-    mountainCoords.forEach((m) => {
-      const peak = createMountainPeak(m.s);
-      peak.position.set(m.x, 0.05, m.z);
-      sceneryGroup.add(peak);
-    });
-
-    // Forest clusters
-    const forestCoords = [
-      { x: 1.8, z: -3.5 },
-      { x: 2.2, z: -2.8 },
-      { x: 1.2, z: -2.2 },
-      { x: 3.2, z: 4.8 },
-      { x: 2.5, z: 5.4 },
-      { x: -3.8, z: 4.5 },
-      { x: -4.5, z: 4.8 },
-    ];
-    forestCoords.forEach((f) => {
-      const tree = createPineTree(0.85 + Math.random() * 0.3);
-      tree.position.set(f.x + (Math.random() - 0.5) * 0.6, 0.05, f.z + (Math.random() - 0.5) * 0.6);
-      tree.rotation.y = Math.random() * Math.PI * 2;
-      sceneryGroup.add(tree);
-    });
-
-    // Raycaster for user interaction
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const planeHit = new THREE.Vector3();
+    const panRight = new THREE.Vector3();
+    const panForward = new THREE.Vector3();
+    let dragging = false;
+    let dragButton = -1;
+    let dragAlt = false;
+    let dragDistance = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let hoverId: string | null = null;
 
-    const handlePointerDown = (event: MouseEvent) => {
-      if (event.button === 0) {
-        isUserDraggingRef.current = true;
-        dragStartRef.current = { x: event.clientX, y: event.clientY };
-      }
-    };
-
-    const handlePointerMove = (event: MouseEvent) => {
+    const hoverAt = (event: PointerEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
       mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-      mousePosRef.current.copy(mouse);
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(hitboxes, false);
+      const next = hits.length > 0 ? (hits[0].object.userData.territoryId as string) : null;
+      if (next !== hoverId) {
+        hoverId = next;
+        const cursor = next ? 'pointer' : 'grab';
+        renderer.domElement.style.cursor = cursor;
+        container.style.cursor = cursor;
+      }
+      return next;
+    };
 
-      // Pan with drag
-      if (isUserDraggingRef.current && event.buttons === 1) {
-        const dx = event.clientX - dragStartRef.current.x;
-        const dy = event.clientY - dragStartRef.current.y;
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-          const panSpeed = 0.022;
-          cameraTargetRef.current.x -= dx * panSpeed;
-          cameraTargetRef.current.z -= dy * panSpeed;
-          cameraPosRef.current.x -= dx * panSpeed;
-          cameraPosRef.current.z -= dy * panSpeed;
-          dragStartRef.current = { x: event.clientX, y: event.clientY };
-        }
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 0 && event.button !== 2) return;
+      dragging = true;
+      dragButton = event.button;
+      dragAlt = event.altKey || event.button === 2;
+      dragDistance = 0;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      renderer.domElement.setPointerCapture(event.pointerId);
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      if (!dragging) {
+        hoverAt(event);
+        return;
+      }
+      const dx = event.clientX - lastX;
+      const dy = event.clientY - lastY;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      dragDistance += Math.abs(dx) + Math.abs(dy);
+      const view = viewRef.current;
+      if (dragAlt || dragButton === 2) {
+        view.theta -= dx * 0.005;
+        view.phi = THREE.MathUtils.clamp(view.phi + dy * 0.004, 0.32, 1.15);
+        return;
+      }
+      const sin = Math.sin(view.theta);
+      const cos = Math.cos(view.theta);
+      const lookX = -sin;
+      const lookZ = -cos;
+      panRight.set(-lookZ, 0, lookX).normalize();
+      panForward.set(lookX, 0, lookZ).normalize();
+      const scale = view.radius * 0.00105;
+      view.target.addScaledVector(panRight, -dx * scale);
+      view.target.addScaledVector(panForward, -dy * scale);
+      const limitX = MAP_WIDTH / 2 - 1.5;
+      const limitZ = MAP_HEIGHT / 2 - 1.5;
+      view.target.x = THREE.MathUtils.clamp(view.target.x, -limitX, limitX);
+      view.target.z = THREE.MathUtils.clamp(view.target.z, -limitZ, limitZ);
+      view.target.y = 0;
+    };
+
+    const onPointerUp = (event: PointerEvent) => {
+      if (!dragging || event.button !== dragButton) return;
+      const wasClick = dragButton === 0 && dragDistance < 6;
+      dragging = false;
+      dragButton = -1;
+      if (renderer.domElement.hasPointerCapture(event.pointerId)) {
+        renderer.domElement.releasePointerCapture(event.pointerId);
+      }
+      if (!wasClick) return;
+      const territoryId = hoverAt(event);
+      if (!territoryId) return;
+      const snapshot = stateRef.current;
+      if (snapshot.isDispatchingArmy && snapshot.selectedTerritoryId && snapshot.onDispatchArmy) {
+        snapshot.onDispatchArmy(snapshot.selectedTerritoryId, territoryId);
+      } else {
+        snapshot.onSelectTerritory(territoryId);
       }
     };
 
-    const handlePointerUp = (event: MouseEvent) => {
-      if (event.button === 0) {
-        const dx = Math.abs(event.clientX - dragStartRef.current.x);
-        const dy = Math.abs(event.clientY - dragStartRef.current.y);
-        isUserDraggingRef.current = false;
-
-        // Clean click without drag
-        if (dx < 5 && dy < 5) {
-          const rect = renderer.domElement.getBoundingClientRect();
-          mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-          mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-          raycaster.setFromCamera(mouse, camera);
-          const intersects = raycaster.intersectObjects(territoryHitBoxes);
-
-          if (intersects.length > 0) {
-            const hit = intersects[0];
-            const tId = hit.object.userData?.territoryId;
-            if (tId) {
-              // If dispatching an army
-              if (
-                stateRef.current.isDispatchingArmy &&
-                stateRef.current.selectedTerritoryId &&
-                stateRef.current.onDispatchArmy
-              ) {
-                stateRef.current.onDispatchArmy(stateRef.current.selectedTerritoryId, tId);
-              } else {
-                stateRef.current.onSelectTerritory(tId);
-              }
-            }
-          }
-        }
-      }
-    };
-
-    const handleWheel = (event: WheelEvent) => {
+    const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      const zoomFactor = event.deltaY * 0.015;
-      const targetPos = cameraPosRef.current;
-      const targetCenter = cameraTargetRef.current;
+      let delta = event.deltaY;
+      if (event.deltaMode === 1) delta *= 16;
+      else if (event.deltaMode === 2) delta *= 400;
+      const view = viewRef.current;
+      const factor = Math.exp(delta * 0.00115);
+      const nextRadius = THREE.MathUtils.clamp(view.radius * factor, 8, 46);
+      if (factor < 1) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        if (raycaster.ray.intersectPlane(groundPlane, planeHit)) {
+          view.target.lerp(planeHit, (1 - factor) * 0.55);
+          const limitX = MAP_WIDTH / 2 - 1.5;
+          const limitZ = MAP_HEIGHT / 2 - 1.5;
+          view.target.x = THREE.MathUtils.clamp(view.target.x, -limitX, limitX);
+          view.target.z = THREE.MathUtils.clamp(view.target.z, -limitZ, limitZ);
+          view.target.y = 0;
+        }
+      }
+      view.radius = nextRadius;
+    };
 
-      const direction = targetPos.clone().sub(targetCenter).normalize();
-      const currentDist = targetPos.distanceTo(targetCenter);
-      const newDist = THREE.MathUtils.clamp(currentDist + zoomFactor, 7, 30);
-
-      targetPos.copy(targetCenter).add(direction.multiplyScalar(newDist));
+    const onContextMenu = (event: Event) => event.preventDefault();
+    const onPointerLeave = () => {
+      hoverId = null;
+      renderer.domElement.style.cursor = 'grab';
     };
 
     const dom = renderer.domElement;
-    dom.addEventListener('mousedown', handlePointerDown);
-    dom.addEventListener('mousemove', handlePointerMove);
-    dom.addEventListener('mouseup', handlePointerUp);
-    dom.addEventListener('wheel', handleWheel, { passive: false });
+    dom.addEventListener('pointerdown', onPointerDown);
+    dom.addEventListener('pointermove', onPointerMove);
+    dom.addEventListener('pointerup', onPointerUp);
+    const onPointerCancel = () => {
+      dragging = false;
+      dragButton = -1;
+    };
+    dom.addEventListener('pointercancel', onPointerCancel);
+    dom.addEventListener('wheel', onWheel, { passive: false });
+    dom.addEventListener('contextmenu', onContextMenu);
+    dom.addEventListener('pointerleave', onPointerLeave);
 
-    // Armies rendering dictionary
     const armyMeshes = new Map<string, THREE.Group>();
-
-    // Animation & Render Loop
+    const battlePool: THREE.Group[] = [];
     let animationFrameId = 0;
     const clock = new THREE.Clock();
+
+    const placeArmy = (army: Army, group: THREE.Group, elapsed: number) => {
+      const list = stateRef.current.territories;
+      const origin = list.find((item) => item.id === army.originTerritoryId);
+      const target = army.targetTerritoryId ? list.find((item) => item.id === army.targetTerritoryId) : undefined;
+      let x = army.position.x;
+      let z = army.position.z;
+      let yaw = group.rotation.y;
+      if (origin && target && army.isMarching) {
+        const u = THREE.MathUtils.clamp(army.marchProgress, 0, 1);
+        const x0 = origin.position.x;
+        const z0 = origin.position.z;
+        const x1 = target.position.x;
+        const z1 = target.position.z;
+        const dx = x1 - x0;
+        const dz = z1 - z0;
+        const len = Math.hypot(dx, dz) || 1;
+        const bow = Math.min(0.65, len * 0.12);
+        const mx = (x0 + x1) / 2 + (-dz / len) * bow;
+        const mz = (z0 + z1) / 2 + (dx / len) * bow;
+        const a = (1 - u) * (1 - u);
+        const b = 2 * (1 - u) * u;
+        const c = u * u;
+        x = a * x0 + b * mx + c * x1;
+        z = a * z0 + b * mz + c * z1;
+        const tx = 2 * (1 - u) * (mx - x0) + 2 * u * (x1 - mx);
+        const tz = 2 * (1 - u) * (mz - z0) + 2 * u * (z1 - mz);
+        yaw = Math.atan2(tx, tz);
+      }
+      const bob = army.isMarching ? Math.abs(Math.sin(elapsed * 7 + x * 2)) * 0.04 : 0;
+      group.position.set(x, terrainHeight(x, z) + bob, z);
+      group.rotation.y = yaw;
+    };
 
     function tick() {
       const delta = clock.getDelta();
       const elapsed = clock.getElapsedTime();
+      updateHighlights(hoverId);
 
-      // Smooth Camera Damping
-      camera.position.lerp(cameraPosRef.current, THREE.MathUtils.clamp(delta * 5, 0, 1));
-      const currentLook = new THREE.Vector3();
-      camera.getWorldDirection(currentLook);
-      const targetDir = cameraTargetRef.current.clone().sub(camera.position).normalize();
-      camera.lookAt(
-        cameraTargetRef.current.x,
-        cameraTargetRef.current.y,
-        cameraTargetRef.current.z
-      );
+      poseFromView(viewRef.current, desiredPos);
+      const damp = 1 - Math.exp(-delta * (dragging ? 16 : 6));
+      camera.position.lerp(desiredPos, damp);
+      lookAt.lerp(viewRef.current.target, damp);
+      camera.lookAt(lookAt);
 
-      // Animate Armies
+      banners.forEach((banner, index) => {
+        const base = (banner.userData.baseRot as number) ?? banner.rotation.y;
+        banner.rotation.y = base + Math.sin(elapsed * 1.5 + index) * 0.16;
+      });
+
       const currentArmies = stateRef.current.armies;
       const activeIds = new Set<string>();
-
       currentArmies.forEach((army) => {
         activeIds.add(army.id);
         let mesh = armyMeshes.get(army.id);
         if (!mesh) {
-          const color = getLordColor(army.ownerId);
-          mesh = createArmyFigure(color, army.size);
+          mesh = createArmyFormation(getLordColor(army.ownerId), army.size);
           armiesGroup.add(mesh);
           armyMeshes.set(army.id, mesh);
         }
-
-        // Update position
-        mesh.position.set(army.position.x, 0.08, army.position.z);
-
-        // Marching bobbing animation
-        if (army.isMarching) {
-          mesh.position.y = 0.08 + Math.abs(Math.sin(elapsed * 6)) * 0.06;
-          mesh.rotation.y = Math.sin(elapsed * 4) * 0.15;
-        } else {
-          mesh.position.y = 0.08;
-          mesh.rotation.y = 0;
-        }
+        placeArmy(army, mesh, elapsed);
       });
-
-      // Remove vanished armies
       armyMeshes.forEach((mesh, id) => {
-        if (!activeIds.has(id)) {
-          armiesGroup.remove(mesh);
-          armyMeshes.delete(id);
-        }
+        if (activeIds.has(id)) return;
+        armiesGroup.remove(mesh);
+        disposeOwnedResources(mesh);
+        armyMeshes.delete(id);
       });
 
-      // Animate Active Battles (Spinning crossed swords)
-      while (battlesGroup.children.length > 0) {
-        battlesGroup.remove(battlesGroup.children[0]);
+      const battles = stateRef.current.activeBattles;
+      while (battlePool.length < Math.min(battles.length, 4)) {
+        const marker = createBattleClashMarker();
+        battlesGroup.add(marker);
+        battlePool.push(marker);
       }
-      stateRef.current.activeBattles.forEach((battle) => {
-        const t = stateRef.current.territories.find((item) => item.id === battle.territoryId);
-        if (t) {
-          const battleMarker = createBattleClashMarker();
-          battleMarker.position.set(t.position.x, 0.8, t.position.z);
-          battleMarker.rotation.y = elapsed * 1.8;
-          battlesGroup.add(battleMarker);
+      battlePool.forEach((marker, index) => {
+        const battle = battles[index];
+        if (!battle) {
+          marker.visible = false;
+          return;
         }
+        const territory = stateRef.current.territories.find((item) => item.id === battle.territoryId);
+        if (!territory) {
+          marker.visible = false;
+          return;
+        }
+        marker.visible = true;
+        marker.position.set(
+          territory.position.x,
+          terrainHeight(territory.position.x, territory.position.z) + 1.15,
+          territory.position.z,
+        );
+        marker.rotation.y = elapsed * 1.6;
+        const fire = marker.getObjectByName('fire');
+        if (fire) fire.scale.setScalar(1 + Math.sin(elapsed * 5 + index) * 0.12);
       });
 
       renderer.render(scene, camera);
@@ -553,8 +754,8 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
         const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
         gl.flush();
         const poll = () => {
-          const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-          if (state === gl.UNSIGNALED) {
+          const status = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+          if (status === gl.UNSIGNALED) {
             animationFrameId = window.setTimeout(poll, 5);
           } else {
             if (sync) gl.deleteSync(sync);
@@ -569,44 +770,46 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
 
     tick();
 
-    // Window Resize Handler
     const handleResize = () => {
-      if (!container) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      camera.aspect = w / h;
+      const nextWidth = container.clientWidth;
+      const nextHeight = container.clientHeight;
+      if (nextWidth < 2 || nextHeight < 2) return;
+      camera.aspect = nextWidth / nextHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(nextWidth, nextHeight);
     };
-    window.addEventListener('resize', handleResize);
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(container);
+    handleResize();
 
     return () => {
-      window.removeEventListener('resize', handleResize);
+      apiRef.current = null;
+      resizeObserver.disconnect();
       cancelAnimationFrame(animationFrameId);
       clearTimeout(animationFrameId);
-
-      dom.removeEventListener('mousedown', handlePointerDown);
-      dom.removeEventListener('mousemove', handlePointerMove);
-      dom.removeEventListener('mouseup', handlePointerUp);
-      dom.removeEventListener('wheel', handleWheel);
-
-      if (container.contains(dom)) {
-        container.removeChild(dom);
-      }
-
+      dom.removeEventListener('pointerdown', onPointerDown);
+      dom.removeEventListener('pointermove', onPointerMove);
+      dom.removeEventListener('pointerup', onPointerUp);
+      dom.removeEventListener('pointercancel', onPointerCancel);
+      dom.removeEventListener('wheel', onWheel);
+      dom.removeEventListener('contextmenu', onContextMenu);
+      dom.removeEventListener('pointerleave', onPointerLeave);
+      if (container.contains(dom)) container.removeChild(dom);
+      disposeOwnedResources(scene);
+      envTexture.dispose();
       renderer.dispose();
-      groundGeo.dispose();
-      groundMat.dispose();
-      parchmentTexture.dispose();
     };
   }, []);
 
+  useEffect(() => {
+    apiRef.current?.sync();
+  }, [territories, playerHouse, rivalLords]);
+
   return (
     <div className="relative w-full h-full overflow-hidden select-none bg-[#090d16]">
-      {/* 3D WebGL Canvas Container */}
-      <div ref={mountRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+      <div ref={mountRef} className="w-full h-full" />
 
-      {/* Floating 3D Map Helper Controls */}
       <div className="absolute top-20 right-6 flex flex-col gap-2 z-10">
         <button
           onClick={resetCamera}
@@ -623,7 +826,6 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
         )}
       </div>
 
-      {/* Territory Mini Map Markers in Viewport */}
       <div className="pointer-events-none absolute bottom-4 left-6 z-10 text-[11px] text-[#e2d5b8]/70 bg-[#090d16]/80 px-3 py-1.5 rounded border border-[#d4af37]/30">
         {t.mapInstructions}
       </div>
