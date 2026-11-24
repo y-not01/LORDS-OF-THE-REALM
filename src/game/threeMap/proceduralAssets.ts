@@ -1,17 +1,163 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import type { BuildingType } from '../../types/game';
+import type { BuildingType, Territory } from '../../types/game';
 
 export const MAP_WIDTH = 26;
 export const MAP_HEIGHT = 24;
 
-/** Same displacement used by the parchment mesh, rivers, and props. */
+export type TerrainAnchor = { x: number; z: number; amount: number; radius: number };
+export type RiverBed = { x1: number; z1: number; x2: number; z2: number };
+
+type SceneryPoint = { x: number; z: number };
+export type BiomeScenery = {
+  anchors: TerrainAnchor[];
+  beds: RiverBed[];
+  rivers: SceneryPoint[][];
+  coasts: { x: number; z: number; rx: number; rz: number }[];
+  forests: { x: number; z: number; rot: number; scale: number; tint: number }[];
+  mountains: { x: number; z: number; s: number; rot: number }[];
+  washes: { x: number; z: number; radius: number; color: string; opacity: number }[];
+};
+
+let terrainAnchors: TerrainAnchor[] = [];
+let riverBeds: RiverBed[] = [];
+
+export function configureTerrain(anchors: TerrainAnchor[], beds: RiverBed[]) {
+  terrainAnchors = anchors;
+  riverBeds = beds;
+}
+
+function smoothFalloff(distance: number, radius: number) {
+  const t = 1 - Math.min(Math.max(distance / radius, 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
+function distanceToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number) {
+  const abx = bx - ax;
+  const abz = bz - az;
+  const len2 = abx * abx + abz * abz || 1;
+  const t = Math.min(Math.max(((px - ax) * abx + (pz - az) * abz) / len2, 0), 1);
+  return Math.hypot(px - (ax + abx * t), pz - (az + abz * t));
+}
+
+/** Parchment relief plus biome mounds, valleys, and dug riverbeds. */
 export function terrainHeight(x: number, z: number): number {
-  const elev =
-    Math.sin(x * 0.35) * Math.cos(z * 0.3) * 0.35 +
-    Math.sin(x * 0.8 + z * 0.4) * 0.18 +
-    (Math.abs(x) > 9 || Math.abs(z) > 8 ? -0.4 : 0);
-  return Math.max(-0.25, elev);
+  let elev =
+    Math.sin(x * 0.35) * Math.cos(z * 0.3) * 0.16 +
+    Math.sin(x * 0.8 + z * 0.4) * 0.08;
+  if (Math.abs(x) > 9 || Math.abs(z) > 8) elev -= 0.32;
+
+  for (const anchor of terrainAnchors) {
+    elev += anchor.amount * smoothFalloff(Math.hypot(x - anchor.x, z - anchor.z), anchor.radius);
+  }
+  for (const bed of riverBeds) {
+    elev -= 0.18 * smoothFalloff(distanceToSegment(x, z, bed.x1, bed.z1, bed.x2, bed.z2), 0.95);
+  }
+  return Math.max(-0.62, elev);
+}
+
+function coastShore(territory: Territory): SceneryPoint {
+  const len = Math.hypot(territory.position.x, territory.position.z);
+  if (len < 1.2) return { x: territory.position.x, z: territory.position.z + 2.7 };
+  return {
+    x: territory.position.x + (territory.position.x / len) * 2.35,
+    z: territory.position.z + (territory.position.z / len) * 2.35,
+  };
+}
+
+function insetPoint(from: SceneryPoint, toward: SceneryPoint, distance: number): SceneryPoint {
+  const dx = toward.x - from.x;
+  const dz = toward.z - from.z;
+  const len = Math.hypot(dx, dz) || 1;
+  const step = Math.min(distance, len * 0.45);
+  return { x: from.x + (dx / len) * step, z: from.z + (dz / len) * step };
+}
+
+/** Mountains, forests, river links, and coasts taken from territory biomes. */
+export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
+  const byId = new Map(territories.map((territory) => [territory.id, territory]));
+  const anchors: TerrainAnchor[] = [];
+  const beds: RiverBed[] = [];
+  const rivers: SceneryPoint[][] = [];
+  const coasts: BiomeScenery['coasts'] = [];
+  const forests: BiomeScenery['forests'] = [];
+  const mountains: BiomeScenery['mountains'] = [];
+  const washes: BiomeScenery['washes'] = [];
+  const seen = new Set<string>();
+  const clearOfCastles = (x: number, z: number, minDistance: number) =>
+    territories.every((territory) => Math.hypot(territory.position.x - x, territory.position.z - z) >= minDistance);
+
+  territories.forEach((territory) => {
+    const { x, z } = territory.position;
+    if (territory.biome === 'mountains') {
+      anchors.push({ x, z, amount: 0.88, radius: 3.2 });
+      washes.push({ x, z, radius: 2.55, color: '#7d756c', opacity: 0.2 });
+      for (let i = 0; i < 4; i++) {
+        const angle = (i / 4) * Math.PI * 2 + 0.55;
+        const radius = 1.7 + (i % 2) * 0.5;
+        const px = x + Math.cos(angle) * radius;
+        const pz = z + Math.sin(angle) * radius;
+        if (!clearOfCastles(px, pz, 1.2)) continue;
+        mountains.push({ x: px, z: pz, s: 1.08 + (i % 3) * 0.16, rot: angle });
+      }
+    } else if (territory.biome === 'hills') {
+      anchors.push({ x, z, amount: 0.36, radius: 2.55 });
+      for (let i = 0; i < 2; i++) {
+        const angle = i * 2.4 + 0.8;
+        const px = x + Math.cos(angle) * 1.75;
+        const pz = z + Math.sin(angle) * 1.75;
+        if (!clearOfCastles(px, pz, 1.2)) continue;
+        mountains.push({ x: px, z: pz, s: 0.7 + i * 0.14, rot: angle });
+      }
+    } else if (territory.biome === 'forest') {
+      anchors.push({ x, z, amount: 0.12, radius: 2.7 });
+      washes.push({ x, z, radius: 2.5, color: '#2c6b34', opacity: 0.4 });
+      for (let i = 0; i < 24; i++) {
+        const angle = i * 2.399963;
+        const radius = 1.05 + (i % 6) * 0.24;
+        const px = x + Math.cos(angle) * radius;
+        const pz = z + Math.sin(angle) * radius;
+        if (!clearOfCastles(px, pz, 0.82)) continue;
+        forests.push({
+          x: px,
+          z: pz,
+          rot: angle,
+          scale: 0.86 + (i % 5) * 0.08,
+          tint: 0.78 + (i % 5) * 0.07,
+        });
+      }
+    } else if (territory.biome === 'riverland') {
+      anchors.push({ x, z, amount: -0.24, radius: 2.2 });
+    } else if (territory.biome === 'coast') {
+      const shore = coastShore(territory);
+      anchors.push({ x, z, amount: -0.06, radius: 1.45 });
+      anchors.push({ x: shore.x, z: shore.z, amount: -0.4, radius: 2.35 });
+      coasts.push({ x: shore.x, z: shore.z, rx: 2.05, rz: 1.2 });
+    }
+  });
+
+  territories.forEach((territory) => {
+    if (territory.biome !== 'riverland') return;
+    territory.connectedTo.forEach((neighborId) => {
+      const other = byId.get(neighborId);
+      if (!other) return;
+      const key = [territory.id, other.id].sort().join('--');
+      if (seen.has(key)) return;
+      seen.add(key);
+      const start = insetPoint(territory.position, other.position, 1.3);
+      const end = other.biome === 'coast' ? coastShore(other) : insetPoint(other.position, territory.position, 1.3);
+      const dx = end.x - start.x;
+      const dz = end.z - start.z;
+      const mid = {
+        x: (start.x + end.x) / 2 + dz * 0.07,
+        z: (start.z + end.z) / 2 - dx * 0.07,
+      };
+      rivers.push([start, mid, end]);
+      beds.push({ x1: start.x, z1: start.z, x2: end.x, z2: end.z });
+    });
+  });
+
+  return { anchors, beds, rivers, coasts, forests, mountains, washes };
 }
 
 export function disposeOwnedResources(root: THREE.Object3D) {
@@ -115,7 +261,7 @@ export function createParchmentTexture(): THREE.CanvasTexture {
 }
 
 export function createParchmentGround(): THREE.Mesh {
-  const geo = ownedGeo(new THREE.PlaneGeometry(MAP_WIDTH, MAP_HEIGHT, 64, 64));
+  const geo = ownedGeo(new THREE.PlaneGeometry(MAP_WIDTH, MAP_HEIGHT, 80, 80));
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
@@ -571,6 +717,24 @@ export function createMedievalCastleGroup(
 
   group.scale.setScalar(hasKeep ? 1 : 0.88);
   return group;
+}
+
+export function createBiomePatch(cx: number, cz: number, radius: number, color: string, opacity: number) {
+  const geo = fanGeometry(cx, cz, radius, 0.035);
+  const mat = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  mat.userData.dispose = true;
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(cx, 0, cz);
+  mesh.renderOrder = 1;
+  return mesh;
 }
 
 function fanGeometry(cx: number, cz: number, radius: number, lift: number) {

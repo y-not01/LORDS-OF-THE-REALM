@@ -7,6 +7,9 @@ import {
   MAP_HEIGHT,
   terrainHeight,
   disposeOwnedResources,
+  configureTerrain,
+  layoutBiomeScenery,
+  createBiomePatch,
   createParchmentGround,
   createPictureFrame,
   createMedievalCastleGroup,
@@ -43,54 +46,6 @@ const DEFAULT_PHI = 0.74;
 const DEFAULT_THETA = 0.48;
 const DEFAULT_RADIUS = 34;
 const GOLD_LIGHT = new THREE.Color('#ffe7a3');
-
-const NORTH_RIVER = [
-  { x: -8.4, z: 3.4 },
-  { x: -5.4, z: 4.55 },
-  { x: -2.4, z: 4.9 },
-  { x: -0.2, z: 6.55 },
-];
-
-const NORTH_SPUR = [
-  { x: -5.4, z: 4.55 },
-  { x: -4.7, z: 3.75 },
-];
-
-const SOUTH_RIVER = [
-  { x: 0.9, z: -5.35 },
-  { x: -1.5, z: -6.9 },
-  { x: -3.4, z: -7.65 },
-];
-
-const SOUTH_SPUR = [
-  { x: 0.9, z: -5.35 },
-  { x: -0.35, z: -5.05 },
-];
-
-const FOREST = [
-  { x: 1.8, z: -3.5 },
-  { x: 2.2, z: -2.8 },
-  { x: 1.2, z: -2.2 },
-  { x: 3.2, z: 4.8 },
-  { x: 2.5, z: 5.4 },
-  { x: -3.8, z: 4.5 },
-  { x: -4.5, z: 4.8 },
-].map((tree, index) => ({
-  x: tree.x + Math.sin(index * 12.3) * 0.28,
-  z: tree.z + Math.cos(index * 4.7) * 0.28,
-  rot: (index * 1.7) % (Math.PI * 2),
-  scale: 0.86 + ((index * 37) % 28) / 100,
-}));
-
-const MOUNTAINS = [
-  { x: 7.2, z: 1.5, s: 1.3, rot: 0.4 },
-  { x: 6.8, z: 3.2, s: 1.1, rot: 1.1 },
-  { x: 8.0, z: -1.2, s: 1.4, rot: 0.2 },
-  { x: -7.5, z: 2.8, s: 1.2, rot: 2.1 },
-  { x: -8.2, z: 0.5, s: 1.5, rot: 0.8 },
-  { x: 3.5, z: -6.0, s: 1.2, rot: 1.6 },
-  { x: 4.8, z: -7.5, s: 1.4, rot: 0.3 },
-];
 
 const HOUSE_OFFSETS = [
   { x: 0.78, z: 0.42, rot: 0.2 },
@@ -281,10 +236,16 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     rimLight.position.set(-15, 10, -12);
     scene.add(rimLight);
 
+    const scenery = layoutBiomeScenery(stateRef.current.territories);
+    configureTerrain(scenery.anchors, scenery.beds);
+
     const ground = createParchmentGround();
     ground.receiveShadow = !isSoftwareGl;
     scene.add(ground);
     scene.add(createPictureFrame());
+    scenery.washes.forEach((wash) => {
+      scene.add(createBiomePatch(wash.x, wash.z, wash.radius, wash.color, wash.opacity));
+    });
 
     const waterGroup = new THREE.Group();
     scene.add(waterGroup);
@@ -299,12 +260,10 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
       mesh.renderOrder = 2.5;
       waterGroup.add(mesh);
     };
-    addWater(createRiverRibbon(NORTH_RIVER, 0.42), riverMaterial);
-    addWater(createRiverRibbon(NORTH_SPUR, 0.28), riverMaterial);
-    addWater(createRiverRibbon(SOUTH_RIVER, 0.4), riverMaterial);
-    addWater(createRiverRibbon(SOUTH_SPUR, 0.26), riverMaterial);
-    addWater(createCoastWashGeometry(-0.6, 7.7, 2.3, 1.25), coastMaterial, -0.6, 7.7);
-    addWater(createCoastWashGeometry(-4.8, -8.55, 2.2, 1.15), coastMaterial, -4.8, -8.55);
+    scenery.rivers.forEach((path) => addWater(createRiverRibbon(path, 0.34), riverMaterial));
+    scenery.coasts.forEach((coast) => {
+      addWater(createCoastWashGeometry(coast.x, coast.z, coast.rx, coast.rz), coastMaterial, coast.x, coast.z);
+    });
 
     const roadGroup = new THREE.Group();
     scene.add(roadGroup);
@@ -328,17 +287,28 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     });
 
     const dummy = new THREE.Object3D();
-    const trunkMesh = new THREE.InstancedMesh(sharedScenery.trunkGeo, sharedScenery.trunkMat, FOREST.length);
+    const treeCount = Math.max(scenery.forests.length, 1);
+    const trunkMesh = new THREE.InstancedMesh(sharedScenery.trunkGeo, sharedScenery.trunkMat, treeCount);
     const tierMeshes = sharedScenery.treeTierGeos.map(
-      (geo) => new THREE.InstancedMesh(geo, sharedScenery.needleMat, FOREST.length),
+      (geo) => new THREE.InstancedMesh(geo, sharedScenery.needleMat, treeCount),
     );
-    FOREST.forEach((tree, index) => {
+    const leafColor = new THREE.Color();
+    scenery.forests.forEach((tree, index) => {
       dummy.position.set(tree.x, terrainHeight(tree.x, tree.z), tree.z);
       dummy.rotation.set(0, tree.rot, 0);
       dummy.scale.setScalar(tree.scale);
       dummy.updateMatrix();
       trunkMesh.setMatrixAt(index, dummy.matrix);
-      tierMeshes.forEach((mesh) => mesh.setMatrixAt(index, dummy.matrix));
+      leafColor.setRGB(tree.tint * 0.82, tree.tint * 1.18, tree.tint * 0.72);
+      tierMeshes.forEach((mesh) => {
+        mesh.setMatrixAt(index, dummy.matrix);
+        mesh.setColorAt(index, leafColor);
+      });
+    });
+    trunkMesh.count = scenery.forests.length;
+    tierMeshes.forEach((mesh) => {
+      mesh.count = scenery.forests.length;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     });
     [trunkMesh, ...tierMeshes].forEach((mesh) => {
       mesh.frustumCulled = false;
@@ -346,11 +316,12 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
       scene.add(mesh);
     });
 
-    const peakMesh = new THREE.InstancedMesh(sharedScenery.peakGeo, sharedScenery.rockMat, MOUNTAINS.length);
-    const snowMesh = new THREE.InstancedMesh(sharedScenery.snowCapGeo, sharedScenery.snowMat, MOUNTAINS.length);
-    const subAMesh = new THREE.InstancedMesh(sharedScenery.subPeakAGeo, sharedScenery.rockMat, MOUNTAINS.length);
-    const subBMesh = new THREE.InstancedMesh(sharedScenery.subPeakBGeo, sharedScenery.rockMat, MOUNTAINS.length);
-    MOUNTAINS.forEach((mountain, index) => {
+    const peakCount = Math.max(scenery.mountains.length, 1);
+    const peakMesh = new THREE.InstancedMesh(sharedScenery.peakGeo, sharedScenery.rockMat, peakCount);
+    const snowMesh = new THREE.InstancedMesh(sharedScenery.snowCapGeo, sharedScenery.snowMat, peakCount);
+    const subAMesh = new THREE.InstancedMesh(sharedScenery.subPeakAGeo, sharedScenery.rockMat, peakCount);
+    const subBMesh = new THREE.InstancedMesh(sharedScenery.subPeakBGeo, sharedScenery.rockMat, peakCount);
+    scenery.mountains.forEach((mountain, index) => {
       const groundY = terrainHeight(mountain.x, mountain.z);
       dummy.position.set(mountain.x, groundY, mountain.z);
       dummy.rotation.set(0, mountain.rot, 0);
@@ -371,10 +342,15 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
       dummy.updateMatrix();
       subBMesh.setMatrixAt(index, dummy.matrix);
     });
-    peakMesh.castShadow = !isSoftwareGl;
-    peakMesh.receiveShadow = !isSoftwareGl;
+    peakMesh.count = scenery.mountains.length;
+    snowMesh.count = scenery.mountains.length;
+    subAMesh.count = scenery.mountains.length;
+    subBMesh.count = scenery.mountains.length;
+    peakMesh.castShadow = !isSoftwareGl && scenery.mountains.length > 0;
+    peakMesh.receiveShadow = !isSoftwareGl && scenery.mountains.length > 0;
     [peakMesh, snowMesh, subAMesh, subBMesh].forEach((mesh) => {
       mesh.frustumCulled = false;
+      mesh.visible = scenery.mountains.length > 0;
       scene.add(mesh);
     });
 
