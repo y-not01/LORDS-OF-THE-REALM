@@ -7,24 +7,27 @@ export const MAP_HEIGHT = 24;
 
 export type TerrainAnchor = { x: number; z: number; amount: number; radius: number };
 export type RiverBed = { x1: number; z1: number; x2: number; z2: number };
+export type GroundTint = { x: number; z: number; kind: 'mountains' | 'hills' | 'forest' };
 
 type SceneryPoint = { x: number; z: number };
 export type BiomeScenery = {
   anchors: TerrainAnchor[];
   beds: RiverBed[];
+  tints: GroundTint[];
   rivers: SceneryPoint[][];
   coasts: { x: number; z: number; rx: number; rz: number }[];
   forests: { x: number; z: number; rot: number; scale: number; tint: number }[];
   mountains: { x: number; z: number; s: number; rot: number }[];
-  washes: { x: number; z: number; radius: number; color: string; opacity: number }[];
 };
 
 let terrainAnchors: TerrainAnchor[] = [];
 let riverBeds: RiverBed[] = [];
+let groundTints: GroundTint[] = [];
 
-export function configureTerrain(anchors: TerrainAnchor[], beds: RiverBed[]) {
+export function configureTerrain(anchors: TerrainAnchor[], beds: RiverBed[], tints: GroundTint[] = []) {
   terrainAnchors = anchors;
   riverBeds = beds;
+  groundTints = tints;
 }
 
 function smoothFalloff(distance: number, radius: number) {
@@ -78,11 +81,11 @@ export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
   const byId = new Map(territories.map((territory) => [territory.id, territory]));
   const anchors: TerrainAnchor[] = [];
   const beds: RiverBed[] = [];
+  const tints: GroundTint[] = [];
   const rivers: SceneryPoint[][] = [];
   const coasts: BiomeScenery['coasts'] = [];
   const forests: BiomeScenery['forests'] = [];
   const mountains: BiomeScenery['mountains'] = [];
-  const washes: BiomeScenery['washes'] = [];
   const seen = new Set<string>();
   const clearOfCastles = (x: number, z: number, minDistance: number) =>
     territories.every((territory) => Math.hypot(territory.position.x - x, territory.position.z - z) >= minDistance);
@@ -91,7 +94,7 @@ export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
     const { x, z } = territory.position;
     if (territory.biome === 'mountains') {
       anchors.push({ x, z, amount: 0.88, radius: 3.2 });
-      washes.push({ x, z, radius: 2.55, color: '#7d756c', opacity: 0.2 });
+      tints.push({ x, z, kind: 'mountains' });
       for (let i = 0; i < 4; i++) {
         const angle = (i / 4) * Math.PI * 2 + 0.55;
         const radius = 1.7 + (i % 2) * 0.5;
@@ -102,6 +105,7 @@ export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
       }
     } else if (territory.biome === 'hills') {
       anchors.push({ x, z, amount: 0.36, radius: 2.55 });
+      tints.push({ x, z, kind: 'hills' });
       for (let i = 0; i < 2; i++) {
         const angle = i * 2.4 + 0.8;
         const px = x + Math.cos(angle) * 1.75;
@@ -111,7 +115,7 @@ export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
       }
     } else if (territory.biome === 'forest') {
       anchors.push({ x, z, amount: 0.12, radius: 2.7 });
-      washes.push({ x, z, radius: 2.5, color: '#2c6b34', opacity: 0.4 });
+      tints.push({ x, z, kind: 'forest' });
       for (let i = 0; i < 24; i++) {
         const angle = i * 2.399963;
         const radius = 1.05 + (i % 6) * 0.24;
@@ -157,7 +161,7 @@ export function layoutBiomeScenery(territories: Territory[]): BiomeScenery {
     });
   });
 
-  return { anchors, beds, rivers, coasts, forests, mountains, washes };
+  return { anchors, beds, tints, rivers, coasts, forests, mountains };
 }
 
 export function disposeOwnedResources(root: THREE.Object3D) {
@@ -187,18 +191,94 @@ function ownedGeo<T extends THREE.BufferGeometry>(geo: T): T {
   return geo;
 }
 
-export function createParchmentTexture(): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 1024;
-  canvas.height = 1024;
-  const ctx = canvas.getContext('2d')!;
+const PAPER = { r: 236, g: 226, b: 198 };
+const OCHRE = { r: 206, g: 154, b: 62 };
+const SOIL = { r: 138, g: 82, b: 40 };
+const LEAF = { r: 150, g: 208, b: 98 };
 
-  const grad = ctx.createRadialGradient(512, 512, 100, 512, 512, 700);
-  grad.addColorStop(0, '#f5edd6');
-  grad.addColorStop(0.6, '#e8dcba');
-  grad.addColorStop(1, '#c9b990');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 1024, 1024);
+function mixChannel(from: number, to: number, amount: number) {
+  return from + (to - from) * amount;
+}
+
+function plateau(distance: number, flat: number, fade: number) {
+  if (distance <= flat) return 1;
+  if (distance >= fade) return 0;
+  const t = 1 - (distance - flat) / (fade - flat);
+  return t * t * (3 - 2 * t);
+}
+
+/** Brown ring between the light-green grove and the surrounding ground. */
+function soilRing(distance: number) {
+  const inner = 2.55;
+  const outer = 4.35;
+  if (distance <= inner || distance >= outer) return 0;
+  const mid = (inner + outer) / 2;
+  const half = (outer - inner) / 2;
+  const t = 1 - Math.abs(distance - mid) / half;
+  return t * t * (3 - 2 * t);
+}
+
+/** Ochre on high ground, soil on the forest fringe, light green in the grove. */
+function sampleGroundColor(x: number, z: number) {
+  let mountain = 0;
+  let hill = 0;
+  let forestCore = 0;
+  let forestSoil = 0;
+  for (const tint of groundTints) {
+    const distance = Math.hypot(x - tint.x, z - tint.z);
+    if (tint.kind === 'mountains') mountain = Math.max(mountain, plateau(distance, 1.7, 4.4));
+    else if (tint.kind === 'hills') hill = Math.max(hill, plateau(distance, 1.4, 3.8));
+    else {
+      forestCore = Math.max(forestCore, plateau(distance, 2.45, 3.25));
+      forestSoil = Math.max(forestSoil, soilRing(distance));
+    }
+  }
+
+  const ochreMix = Math.max(mountain, hill * 0.9);
+  let r = mixChannel(PAPER.r, OCHRE.r, ochreMix);
+  let g = mixChannel(PAPER.g, OCHRE.g, ochreMix);
+  let b = mixChannel(PAPER.b, OCHRE.b, ochreMix);
+
+  const hillSoil = hill * (1 - mountain) * 0.35;
+  r = mixChannel(r, SOIL.r, hillSoil);
+  g = mixChannel(g, SOIL.g, hillSoil);
+  b = mixChannel(b, SOIL.b, hillSoil);
+
+  r = mixChannel(r, SOIL.r, forestSoil);
+  g = mixChannel(g, SOIL.g, forestSoil);
+  b = mixChannel(b, SOIL.b, forestSoil);
+
+  return {
+    r: mixChannel(r, LEAF.r, forestCore),
+    g: mixChannel(g, LEAF.g, forestCore),
+    b: mixChannel(b, LEAF.b, forestCore),
+  };
+}
+
+export function createParchmentTexture(): THREE.CanvasTexture {
+  const size = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const image = ctx.createImageData(size, size);
+  const data = image.data;
+  for (let py = 0; py < size; py++) {
+    const v = 1 - (py + 0.5) / size;
+    const z = (0.5 - v) * MAP_HEIGHT;
+    for (let px = 0; px < size; px++) {
+      const u = (px + 0.5) / size;
+      const x = (u - 0.5) * MAP_WIDTH;
+      const color = sampleGroundColor(x, z);
+      const grain = 0.96 + Math.random() * 0.07;
+      const index = (py * size + px) * 4;
+      data[index] = Math.min(255, color.r * grain);
+      data[index + 1] = Math.min(255, color.g * grain);
+      data[index + 2] = Math.min(255, color.b * grain);
+      data[index + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
 
   for (let i = 0; i < 3500; i++) {
     const x = Math.random() * 1024;
@@ -717,24 +797,6 @@ export function createMedievalCastleGroup(
 
   group.scale.setScalar(hasKeep ? 1 : 0.88);
   return group;
-}
-
-export function createBiomePatch(cx: number, cz: number, radius: number, color: string, opacity: number) {
-  const geo = fanGeometry(cx, cz, radius, 0.035);
-  const mat = new THREE.MeshBasicMaterial({
-    color,
-    transparent: true,
-    opacity,
-    depthWrite: false,
-    polygonOffset: true,
-    polygonOffsetFactor: -1,
-    polygonOffsetUnits: -1,
-  });
-  mat.userData.dispose = true;
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set(cx, 0, cz);
-  mesh.renderOrder = 1;
-  return mesh;
 }
 
 function fanGeometry(cx: number, cz: number, radius: number, lift: number) {

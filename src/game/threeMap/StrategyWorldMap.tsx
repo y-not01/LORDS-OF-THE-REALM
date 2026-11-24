@@ -9,7 +9,6 @@ import {
   disposeOwnedResources,
   configureTerrain,
   layoutBiomeScenery,
-  createBiomePatch,
   createParchmentGround,
   createPictureFrame,
   createMedievalCastleGroup,
@@ -237,15 +236,12 @@ export const StrategyWorldMap: React.FC<StrategyWorldMapProps> = ({
     scene.add(rimLight);
 
     const scenery = layoutBiomeScenery(stateRef.current.territories);
-    configureTerrain(scenery.anchors, scenery.beds);
+    configureTerrain(scenery.anchors, scenery.beds, scenery.tints);
 
     const ground = createParchmentGround();
     ground.receiveShadow = !isSoftwareGl;
     scene.add(ground);
     scene.add(createPictureFrame());
-    scenery.washes.forEach((wash) => {
-      scene.add(createBiomePatch(wash.x, wash.z, wash.radius, wash.color, wash.opacity));
-    });
 
     const waterGroup = new THREE.Group();
     scene.add(waterGroup);
